@@ -1,0 +1,190 @@
+name: 'Secrets Scanner Example'
+
+# Trigger the workflow on pull requests and pushes to main branches
+on:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main, develop ]
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      scan-path:
+        description: 'Path to scan (default: entire repo)'
+        required: false
+        default: '.'
+      severity-threshold:
+        description: 'Minimum severity (low, medium, high, critical)'
+        required: false
+        default: 'medium'
+        type: choice
+        options:
+        - low
+        - medium
+        - high
+        - critical
+
+jobs:
+  secrets-scan:
+    name: 'Scan for Secrets'
+    runs-on: ubuntu-latest
+    
+    # Required permissions for the action to work properly
+    permissions:
+      contents: read              # Read repository contents
+      pull-requests: write        # Comment on pull requests
+      security-events: write      # Upload SARIF to GitHub Security tab
+      actions: read              # Read workflow information
+    
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history for comprehensive scanning
+          fetch-depth: 0
+      
+      - name: 'Run Secrets Scanner'
+        uses: ./  # Use the local action (change to vercel-labs/secrets-scanner@v1 for external use)
+        id: secrets-scan
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          scan-path: ${{ github.event.inputs.scan-path || '.' }}
+          exclude-paths: 'node_modules,.git,dist,build,coverage,.next,out,vendor'
+          fail-on-detection: true
+          comment-pr: true
+          severity-threshold: ${{ github.event.inputs.severity-threshold || 'medium' }}
+          # Example custom patterns for demonstration
+          custom-patterns: >-
+            {
+              "vercel-token": {
+                "pattern": "vercel_[a-zA-Z0-9]{32}",
+                "severity": "critical",
+                "description": "Vercel Deployment Token"
+              },
+              "database-password": {
+                "pattern": "DB_PASS(WORD)?[\"\\s]*[=:][\"\\s]*[^\"\\s]{8,}",
+                "severity": "high",
+                "description": "Database Password"
+              },
+              "generic-token": {
+                "pattern": "[a-zA-Z0-9]{32,64}",
+                "severity": "low",
+                "description": "Generic Long String (Potential Token)"
+              }
+            }
+      
+      - name: 'Upload JSON Report as Artifact'
+        if: always()  # Always run, even if secrets are found
+        uses: actions/upload-artifact@v3
+        with:
+          name: secrets-scan-report
+          path: secrets-scan-report.json
+          retention-days: 30
+      
+      - name: 'Upload SARIF Report to GitHub Security'
+        if: always()  # Always upload SARIF results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: secrets-scan-results.sarif
+          category: 'secrets-scanner'
+      
+      - name: 'Display Scan Summary'
+        if: always()
+        run: |
+          echo "## 🔍 Secrets Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Secrets Found:** ${{ steps.secrets-scan.outputs.secrets-found }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Has Secrets:** ${{ steps.secrets-scan.outputs.has-secrets }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Report File:** ${{ steps.secrets-scan.outputs.report-file }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **SARIF File:** ${{ steps.secrets-scan.outputs.sarif-file }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.secrets-scan.outputs.has-secrets }}" = "true" ]; then
+            echo "### ⚠️ Action Required" >> $GITHUB_STEP_SUMMARY
+            echo "Secrets were detected in your code. Please:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Review the findings in the detailed report" >> $GITHUB_STEP_SUMMARY
+            echo "2. Remove or rotate any exposed secrets" >> $GITHUB_STEP_SUMMARY
+            echo "3. Use environment variables for sensitive data" >> $GITHUB_STEP_SUMMARY
+            echo "4. Add sensitive files to .gitignore" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ✅ No Secrets Detected" >> $GITHUB_STEP_SUMMARY
+            echo "Great! No secrets were found in the scanned code." >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      # Example of conditional steps based on scan results
+      - name: 'Create Security Issue (Critical Secrets Found)'
+        if: steps.secrets-scan.outputs.has-secrets == 'true' && github.event_name == 'push'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'security,secrets-detected',
+              state: 'open'
+            });
+            
+            if (issues.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: '🚨 Secrets Detected in Repository',
+                body: `## Security Alert\n\nThe secrets scanner has detected ${{ steps.secrets-scan.outputs.secrets-found }} potential secrets in the repository.\n\n**Action Required:**\n1. Review the scan results in the [Actions tab](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n2. Remove or rotate any exposed secrets\n3. Implement proper secret management\n\n**Commit:** ${context.sha}\n**Triggered by:** ${context.eventName}`,
+                labels: ['security', 'secrets-detected', 'priority-high']
+              });
+            }
+
+  # Optional: Separate job for different scan configurations
+  quick-scan:
+    name: 'Quick Scan (High Severity Only)'
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+      
+      - name: 'Quick Security Scan'
+        uses: ./
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          scan-path: './src'  # Only scan source code
+          severity-threshold: 'high'  # Only report high and critical
+          fail-on-detection: false    # Don't fail PR for quick scan
+          comment-pr: false          # Don't comment to avoid spam
+
+  # Example: Scheduled comprehensive scan
+  weekly-full-scan:
+    name: 'Weekly Comprehensive Scan'
+    runs-on: ubuntu-latest
+    if: github.event.schedule  # Only run on scheduled events
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for comprehensive scan
+      
+      - name: 'Comprehensive Security Scan'
+        uses: ./
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          severity-threshold: 'low'   # Scan all severity levels
+          fail-on-detection: false    # Don't fail scheduled scans
+          exclude-paths: 'node_modules,.git'  # Minimal exclusions
+      
+      - name: 'Archive Comprehensive Report'
+        uses: actions/upload-artifact@v3
+        with:
+          name: weekly-security-scan-${{ github.run_number }}
+          path: |
+            secrets-scan-report.json
+            secrets-scan-results.sarif
+          retention-days: 90  # Keep weekly reports longer
